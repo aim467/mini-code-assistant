@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-code-assistant"
+version = "0.2.0"
+description = "迷你编程助手 - 理解 Codex / Claude Code / OpenCode 的核心实现原理"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+# 可选依赖：安装后启用 token 精确计数和语法高亮
+# pip install -e ".[full]" 或 pip install mini-code-assistant[full]
+full = [
+    "tiktoken>=0.5.0",    # 精确 token 计数（OpenAI 模型）
+    "pygments>=2.15.0",   # diff 语法高亮
+    "prompt_toolkit>=3.0.0",  # 增强交互式 REPL（命令历史、自动补全）
+]
+
+# ── console_scripts 入口点 ──────────────────────────────────
+# 安装后 (pip install -e .)，会在 Python Scripts/ 目录下生成
+# 一个名为 `mca` 的可执行文件，自动加入系统 PATH。
+# 用户在任意目录输入 `mca` 即可启动。
+#
+# Windows:  生成 mca.exe（放入 Python\Scripts\）
+# Linux/macOS: 生成 mca 脚本（放入 ~/.local/bin/ 或 /usr/local/bin/）
+[project.scripts]
+mca = "mini_code_assistant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

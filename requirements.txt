@@ -1,0 +1,12 @@
+# Mini Code Assistant 依赖
+# requests: 用于调用 LLM API
+# rich: 终端 Markdown 渲染 + 美化输出（可选，缺失时降级为纯文本）
+requests>=2.28.0
+rich>=13.0.0
+
+# ── 可选依赖（安装后自动启用额外功能）──────────────────────
+# pip install -r requirements.txt 安装全部依赖
+# 或 pip install -e ".[full]" 通过 extras 安装
+tiktoken>=0.5.0       # 精确 token 计数（缺失时用字符估算降级）
+pygments>=2.15.0      # diff 语法高亮（缺失时用纯 ANSI 颜色降级）
+prompt_toolkit>=3.0.0 # 增强交互式 REPL：命令历史、自动补全、多行编辑
