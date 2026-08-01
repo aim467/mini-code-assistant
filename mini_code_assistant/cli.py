@@ -11,10 +11,12 @@ cli.py - Mini Code Assistant 命令行入口
     用户输入 → 处理 → 等待下一次输入
 
   Agent Loop（内层）：
-    用户消息 → 发给 LLM → LLM 请求工具调用 → 执行工具 → 结果喂回 LLM
-    → LLM 继续推理 → ... → LLM 给出最终回复
+    用户消息 → 发给 LLM（流式）→ LLM 逐块返回文本/工具调用
+    → 如果有工具调用 → 执行工具 → 结果喂回 LLM → 继续推理
+    → 如果只有文本 → 显示最终回复，结束循环
 
   这两个嵌套循环就是 Claude Code、Codex 等工具的基本架构。
+  流式输出（SSE）让用户实时看到 LLM 的生成过程，无需等待完整响应。
 
 使用方式:
     # 全局安装后（推荐）
@@ -129,13 +131,14 @@ def print_banner(workdir: Path, model: str, context_limit: int):
     """打印启动横幅。"""
     token_mode = "tiktoken" if HAS_TIKTOKEN else "estimated"
     repl_mode = "prompt_toolkit" if HAS_PROMPT_TOOLKIT else "basic"
+    stream_mode = "streaming"  # 流式输出始终启用
     if HAS_RICH:
         _console.print(Panel(
             f"[bold cyan]Mini Code Assistant[/]  v{__version__}\n"
             f"[dim]workdir:[/] {workdir}\n"
             f"[dim]model:  [/] {model}\n"
             f"[dim]context:[/] {context_limit:,} tokens  [dim]token count: {token_mode}[/]\n"
-            f"[dim]repl:   [/] {repl_mode}",
+            f"[dim]repl:   [/] {repl_mode}  [dim]output:[/] {stream_mode}",
             border_style="cyan",
             padding=(1, 2),
         ))
@@ -153,7 +156,7 @@ def print_banner(workdir: Path, model: str, context_limit: int):
         print(f"  {C.DIM}workdir:{C.RESET} {workdir}")
         print(f"  {C.DIM}model:  {C.RESET} {model}")
         print(f"  {C.DIM}context:{C.RESET} {context_limit:,} tokens  {C.DIM}(token count: {token_mode}){C.RESET}")
-        print(f"  {C.DIM}repl:   {C.RESET} {repl_mode}")
+        print(f"  {C.DIM}repl:   {C.RESET} {repl_mode}  {C.DIM}output:{C.RESET} {stream_mode}")
         print(f"  {C.DIM}--------------------------------------{C.RESET}")
         if HAS_PROMPT_TOOLKIT:
             print(f"  type {C.YELLOW}/help{C.RESET} for help, {C.YELLOW}/exit{C.RESET} to quit  {C.DIM}(↑↓ history, Tab complete, Ctrl+R search){C.RESET}\n")
@@ -281,10 +284,14 @@ def run_agent_loop(llm: LLMClient, tools: ToolSystem, context: Context):
     Agent 循环——编程助手的核心引擎。
 
     流程：
-    1. 把对话历史（含用户最新消息）发给 LLM
+    1. 把对话历史（含用户最新消息）发给 LLM（流式）
     2. LLM 返回回复：
        a. 如果包含 tool_calls → 执行工具，把结果加入历史，回到步骤 1
        b. 如果只有文本 → 这是最终回复，显示给用户，结束循环
+
+    流式输出原理：
+      使用 chat_stream() 逐块接收 LLM 响应，文本增量实时打印，
+      工具调用增量逐步拼接。用户无需等待完整响应即可看到输出。
 
     这个循环会重复执行，直到：
     - LLM 不再请求工具调用（给出最终回复）
@@ -297,26 +304,78 @@ def run_agent_loop(llm: LLMClient, tools: ToolSystem, context: Context):
     msg_count_before = len(context.messages)
 
     for iteration in range(MAX_ITERATIONS):
-        # ── 调用 LLM ──────────────────────────────────────
-        response = llm.chat(context.messages, tools.definitions)
+        # ── 流式调用 LLM ────────────────────────────────────
+        # 逐块接收响应，实时显示文本，拼接工具调用
+        content = ""  # 累积完整文本
+        tool_calls_map = {}  # 累积工具调用：{index: {id, function: {name, arguments}}}
+        finish_reason = None
+        has_error = False
 
-        content = response["content"]
-        tool_calls = response["tool_calls"]
+        # ── 实时显示文本流 ──────────────────────────────────
+        # 流式输出时，文本片段逐个到达，立即打印让用户看到
+        if HAS_RICH:
+            _console.print()  # 输出前空一行
+        else:
+            print()  # 输出前空一行
 
-        # 如果有错误
-        if response["finish_reason"] == "error":
-            if HAS_RICH:
-                _console.print(f"\n  [yellow]{content}[/]")
-            else:
-                print(f"\n  {C.YELLOW}{content}{C.RESET}")
-            return
+        for chunk in llm.chat_stream(context.messages, tools.definitions):
+            chunk_type = chunk["type"]
 
-        # ── 显示文本回复 ──────────────────────────────────
-        if content:
-            if HAS_RICH:
-                _console.print(Markdown(content))
-            else:
-                print(f"\n  {C.CYAN}{C.BOLD}Assistant:{C.RESET} {content}")
+            # ── 文本增量：实时打印 ──────────────────────────
+            if chunk_type == "text_delta":
+                text_delta = chunk["content"]
+                content += text_delta
+                # 逐块打印，无需等待完整响应
+                if HAS_RICH:
+                    _console.print(text_delta, end="", highlight=False)
+                else:
+                    print(f"{C.CYAN}{text_delta}{C.RESET}", end="", flush=True)
+
+            # ── 工具调用增量：逐步拼接 ──────────────────────
+            elif chunk_type == "tool_call_delta":
+                idx = chunk["index"]
+                if idx not in tool_calls_map:
+                    # 第一个 chunk：包含 id 和 name
+                    tool_calls_map[idx] = {
+                        "id": chunk.get("id") or "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                tc = tool_calls_map[idx]
+                # 拼接 id
+                if chunk.get("id"):
+                    tc["id"] = chunk["id"]
+                # 拼接 name
+                if chunk.get("name"):
+                    tc["function"]["name"] = chunk["name"]
+                # 拼接 arguments 片段
+                if chunk.get("arguments_delta"):
+                    tc["function"]["arguments"] += chunk["arguments_delta"]
+
+            # ── 流结束 ──────────────────────────────────────
+            elif chunk_type == "done":
+                finish_reason = chunk["finish_reason"]
+
+            # ── 错误 ────────────────────────────────────────
+            elif chunk_type == "error":
+                has_error = True
+                if HAS_RICH:
+                    _console.print(f"\n  [yellow]{chunk['content']}[/]")
+                else:
+                    print(f"\n  {C.YELLOW}{chunk['content']}{C.RESET}")
+                return
+
+        # 流式输出结束，换行
+        if HAS_RICH:
+            _console.print()
+        else:
+            print()
+
+        # ── 将工具调用 map 转为列表格式 ─────────────────────
+        # 与非流式 chat() 返回的 tool_calls 格式保持一致
+        tool_calls = []
+        for idx in sorted(tool_calls_map.keys()):
+            tool_calls.append(tool_calls_map[idx])
 
         # ── 没有工具调用 → LLM 给出了最终回复，结束循环 ──
         if not tool_calls:

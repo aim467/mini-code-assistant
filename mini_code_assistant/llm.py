@@ -14,6 +14,10 @@ llm.py - LLM API 客户端
 
   这个"请求 → 工具调用 → 执行 → 喂回 → 继续"的循环，
   就是所有 AI 编程助手的核心工作模式（Agent Loop）。
+
+  本模块提供两种调用方式：
+  - chat(): 非流式调用，等待完整响应后返回。适合不需要实时显示的场景。
+  - chat_stream(): 流式调用（SSE），逐块返回响应增量。适合实时显示 LLM 输出。
 """
 
 import json
@@ -107,6 +111,137 @@ class LLMClient:
             "tool_calls": message.get("tool_calls") or [],
             "finish_reason": choice["finish_reason"],
         }
+
+    def chat_stream(self, messages: list, tools: list = None):
+        """
+        流式调用 LLM，逐块返回响应（SSE - Server-Sent Events）。
+
+        与 chat() 不同，此方法通过 HTTP 流式传输实时返回 LLM 的输出，
+        用户可以立即看到模型的生成过程，而不必等待完整响应。
+
+        核心原理：
+          OpenAI 兼容 API 支持 stream=True 参数。开启后，响应不再是
+          一次性返回的 JSON，而是分块发送的 SSE 事件流：
+
+            data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+            data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}
+            data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+            data: [DONE]
+
+          每个 chunk 包含一个 delta（增量）对象：
+          - delta.content: 文本增量片段
+          - delta.tool_calls: 工具调用增量片段（分多次发送）
+          - finish_reason: 结束原因（"stop" / "tool_calls" / null）
+
+        参数:
+            messages: 对话历史
+            tools:    可用工具定义列表
+
+        Yields 事件字典:
+            {"type": "text_delta", "content": "..."}              - 文本增量
+            {"type": "tool_call_delta", "index": N,              - 工具调用增量
+             "id": "...", "name": "...", "arguments_delta": "..."}
+            {"type": "done", "finish_reason": "..."}             - 流结束
+            {"type": "error", "content": "..."}                  - 错误
+        """
+        # ── 构建请求体 ────────────────────────────────────────
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": True,  # 关键：启用流式传输
+        }
+
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        # ── 发送流式 HTTP 请求 ────────────────────────────────
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=120,
+                stream=True,  # 关键：不等待完整响应，逐块读取
+            )
+            resp.raise_for_status()
+        except requests.exceptions.ConnectionError:
+            yield {"type": "error", "content": "[错误] 无法连接到 API 服务器，请检查 base_url 和网络。"}
+            return
+        except requests.exceptions.Timeout:
+            yield {"type": "error", "content": "[错误] API 请求超时。"}
+            return
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code
+            body = e.response.text[:200]
+            yield {"type": "error", "content": f"[错误] API 返回 {status}: {body}"}
+            return
+
+        # ── 解析 SSE 事件流 ───────────────────────────────────
+        # SSE 格式：每行以 "data: " 开头，空行分隔事件
+        # 结束标记：data: [DONE]
+        for line in resp.iter_lines(decode_unicode=True):
+            # 跳过空行和注释行（SSE 注释以冒号开头，如 ": keep-alive"）
+            if not line or line.startswith(":"):
+                continue
+
+            # SSE 数据行以 "data: " 开头
+            if not line.startswith("data: "):
+                continue
+
+            data = line[6:]  # 去掉 "data: " 前缀
+
+            # 流结束标记
+            if data.strip() == "[DONE]":
+                yield {"type": "done", "finish_reason": "stop"}
+                return
+
+            # 解析 JSON 数据
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            # 提取 delta 和 finish_reason
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            finish_reason = choice.get("finish_reason")
+
+            # ── 文本增量 ──────────────────────────────────────
+            content_delta = delta.get("content")
+            if content_delta:
+                yield {"type": "text_delta", "content": content_delta}
+
+            # ── 工具调用增量 ──────────────────────────────────
+            # 流式工具调用分多次发送：
+            #   第一个 chunk: 包含 id、type、function.name
+            #   后续 chunks: 只包含 function.arguments 的片段
+            tool_call_deltas = delta.get("tool_calls")
+            if tool_call_deltas:
+                for tc_delta in tool_call_deltas:
+                    func_delta = tc_delta.get("function", {})
+                    yield {
+                        "type": "tool_call_delta",
+                        "index": tc_delta.get("index", 0),
+                        "id": tc_delta.get("id"),
+                        "name": func_delta.get("name"),
+                        "arguments_delta": func_delta.get("arguments", ""),
+                    }
+
+            # ── 流结束 ────────────────────────────────────────
+            if finish_reason:
+                yield {"type": "done", "finish_reason": finish_reason}
+                return
+
+        # 如果流意外结束（没有收到 finish_reason），发送 done 事件
+        yield {"type": "done", "finish_reason": "stop"}
 
     def summarize(self, messages: list) -> str:
         """
