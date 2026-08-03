@@ -31,6 +31,16 @@ llm.py - LLM API 客户端（基于 OpenAI Python SDK）
 from openai import OpenAI, APITimeoutError, APIConnectionError, APIStatusError
 
 
+# 摘要任务的 system 提示词：负责角色与全局约束（防幻觉、保留原文）。
+# 任务本身（结构、语言、数据）放在 user 消息里，避免角色重复声明。
+SUMMARY_SYSTEM = (
+    "You are a meticulous conversation summarizer for a coding assistant. "
+    "Summarize only what actually appears in the transcript; never invent "
+    "files, function names, or decisions. Preserve file paths, function names, "
+    "and error messages verbatim."
+)
+
+
 class LLMClient:
     """封装 OpenAI 兼容的 Chat Completions API。"""
 
@@ -225,7 +235,7 @@ class LLMClient:
         # 如果流意外结束（没有收到 finish_reason），发送 done 事件
         yield {"type": "done", "finish_reason": "stop"}
 
-    def summarize(self, messages: list) -> str:
+    def summarize(self, messages: list, language: str = "中文") -> str:
         """
         让 LLM 对一段对话历史生成摘要。
 
@@ -234,33 +244,62 @@ class LLMClient:
 
         参数:
             messages: 需要摘要的对话消息列表（不含 system prompt）
+            language: 摘要正文使用的语言（默认中文）；文件路径、函数名、
+                      代码与报错信息始终保留原文
 
         返回:
             摘要文本
         """
-        # 把对话历史序列化为可读文本
+        # ── 序列化对话历史 ─────────────────────────────────
+        # 注意：assistant 的 tool_calls 消息 content 通常为空，
+        # 工具名和参数都在 tool_calls 字段里，必须一并序列化，
+        # 否则模型无从得知"用了什么工具"。
         transcript_lines = []
         for msg in messages:
             role = msg.get("role", "?")
             content = msg.get("content") or ""
-            if role == "tool":
-                # 工具结果可能很长，截取前 200 字符
-                content = content[:200] + "..." if len(content) > 200 else content
-                role = "tool_result"
-            transcript_lines.append(f"[{role}]: {content}")
+
+            # assistant 请求调用工具的消息：content 常为空，工具信息在 tool_calls 里
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    args = (fn.get("arguments") or "")[:200]
+                    transcript_lines.append(
+                        f"[assistant tool_call]: {fn.get('name')}({args})"
+                    )
+
+            if content:
+                if role == "tool":
+                    # 工具结果可能很长，截取前 200 字符
+                    content = content[:200] + "..." if len(content) > 200 else content
+                    role = "tool_result"
+                transcript_lines.append(f"[{role}]: {content}")
+
+        # 没有可总结的内容时直接返回，避免浪费一次 API 调用
+        if not transcript_lines:
+            return ""
         transcript = "\n".join(transcript_lines)
 
+        # 任务提示词：角色与全局约束在 SUMMARY_SYSTEM（system 消息）里，
+        # 这里只描述任务本身、输出结构与语言
         summary_prompt = (
-            "You are a conversation summarizer. Summarize the following conversation "
-            "between a user and a coding assistant. Focus on:\n"
-            "1. What the user asked for\n"
-            "2. What files were read, created, or modified (include file paths)\n"
-            "3. What tools were used and key results\n"
-            "4. Any decisions made or important findings\n"
-            "5. Any unresolved issues or next steps\n\n"
-            "Keep the summary concise but preserve all important technical details "
-            "(file paths, function names, error messages). Write in the same language "
-            "as the conversation.\n\n"
+            "Summarize the following conversation between a user and a coding assistant. "
+            "This summary will be used as the assistant's memory for future turns, so it "
+            "must be self-contained: a reader who has not seen the original conversation "
+            "must be able to continue the work from it.\n\n"
+            "Use this Markdown structure and keep the whole summary under ~150 words:\n"
+            "## Goal\n"
+            "What the user asked for.\n"
+            "## Changes\n"
+            "Files created or modified (full paths) and functions added/changed.\n"
+            "## Tool usage\n"
+            "Which tools were called and their key results.\n"
+            "## Decisions & Findings\n"
+            "Decisions made, important findings, exact error messages.\n"
+            "## Next steps\n"
+            "Unresolved issues and pending actions.\n\n"
+            f"Write the prose in {language}. File paths, function names, code, "
+            "and error messages stay verbatim.\n\n"
             f"Conversation to summarize:\n{transcript}"
         )
 
@@ -268,7 +307,7 @@ class LLMClient:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful conversation summarizer."},
+                    {"role": "system", "content": SUMMARY_SYSTEM},
                     {"role": "user", "content": summary_prompt},
                 ],
                 temperature=0.0,  # 摘要需要确定性
