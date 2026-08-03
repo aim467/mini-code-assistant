@@ -2,7 +2,7 @@
 
 A mini coding assistant for learning how tools like Codex / Claude Code / OpenCode work internally.
 
-> **Design philosophy**: minimal code, focus on core principles. Under 500 lines, single core dependency (`requests`), optional dependencies for progressive enhancement.
+> **Design philosophy**: minimal code, focus on core principles. Two core dependencies (`openai` SDK + `rich`), optional dependencies for progressive enhancement.
 
 ---
 
@@ -11,18 +11,18 @@ A mini coding assistant for learning how tools like Codex / Claude Code / OpenCo
 ```
 mini-code-assistant/
 ├── pyproject.toml              # Package config + console_scripts entry point
-├── requirements.txt            # Dependencies (requests + optional enhancements)
+├── requirements.txt            # Dependencies (openai + rich + optional enhancements)
 ├── .env.example                # Config template
-├── main.py                     # Backward-compat wrapper (optional)
 ├── README.md
 └── mini_code_assistant/        # Python package
     ├── __init__.py             # Package marker + __version__
     ├── __main__.py             # `python -m mini_code_assistant` entry
     ├── cli.py                  # CLI entry: argparse + REPL + Agent Loop
-    ├── llm.py                  # LLM client: Chat Completions API + Tool Calling
-    ├── tools.py                # Tool system: file read/write/edit/search + safety
-    ├── context.py              # Context manager: conversation history + system prompt
-    └── diff.py                 # Diff display: difflib + ANSI colors
+    ├── llm.py                  # LLM client: OpenAI SDK, Chat Completions + Tool Calling + Streaming
+    ├── tools.py                # Tool system: 10 tools (file ops, search, shell, glob) + safety
+    ├── context.py              # Context manager: conversation history + smart summarization
+    ├── token_counter.py        # Token counting: tiktoken / estimation + context window map
+    └── diff.py                 # Diff display: difflib + ANSI colors + pygments highlighting
 ```
 
 ### Core concepts
@@ -32,17 +32,17 @@ mini-code-assistant/
 The heart of every AI coding assistant — the interaction cycle between LLM and tools:
 
 ```
-user input → send to LLM → LLM requests tool call (e.g. read file)
+user input → send to LLM (streaming) → LLM requests tool call (e.g. read file)
   → execute tool → feed result back to LLM → LLM continues reasoning
   → may call more tools → ... → LLM gives final response
 ```
 
-Implemented in `cli.py` → `run_agent_loop()`.
+Implemented in `cli.py` → `run_agent_loop()`. Responses are **streamed** (SSE), so you see the model generate in real time instead of waiting for the full response.
 
 **2. Tool Calling**
 
 The LLM can't touch the filesystem directly. Via OpenAI's Tool Calling mechanism:
-- We declare available tools (JSON Schema) in the API request
+- We declare 10 available tools (JSON Schema) in the API request
 - The LLM decides to call a tool, returns tool name + arguments
 - We execute the tool, send the result back as a `role: "tool"` message
 - The LLM continues reasoning based on the result
@@ -57,12 +57,15 @@ The LLM is stateless — each API call is independent. We maintain the full conv
 - `assistant`: model response (may contain tool_calls)
 - `tool`: tool execution result
 
-Implemented in `context.py`.
+When the conversation approaches the model's context window (~80%), we **smart-summarize** old turns with the LLM (or fall back to trimming), keeping the most recent turns intact. Token usage is tracked via the SDK's `usage` field / `tiktoken` / character estimation, and shown in real time with `/tokens`.
+
+Implemented in `context.py` + `token_counter.py`.
 
 **4. Safety**
 - Path traversal protection: all file ops restricted to working directory
 - Write confirmation: diff shown before any file modification
-- Iteration cap: prevents infinite tool-calling loops
+- Command confirmation: `run_command` requires user confirmation before executing
+- Iteration cap (20): prevents infinite tool-calling loops
 
 ---
 
@@ -72,7 +75,7 @@ Implemented in `context.py`.
 
 ```bash
 cd mini-code-assistant
-pip install -e .          # basic install
+pip install -e .          # basic install (openai + rich)
 pip install -e ".[full]"  # full install (enhanced REPL, token counting, syntax highlighting)
 ```
 
@@ -83,6 +86,7 @@ mca                          # run in current directory
 mca /path/to/project         # run in a specific directory
 mca --model deepseek-chat    # override model
 mca --api-key sk-xxx         # override API key
+mca --temperature 0.0        # override sampling temperature
 mca --version                # show version
 ```
 
@@ -99,12 +103,6 @@ pip install -r requirements.txt
 python -m mini_code_assistant [directory] [options]
 ```
 
-### Option C: Direct run (backward compat)
-
-```bash
-python main.py [directory]
-```
-
 ---
 
 ## Configuration
@@ -113,7 +111,7 @@ Config priority (highest to lowest):
 
 | Priority | Source | Scope |
 |----------|--------|-------|
-| 1 | CLI flags (`--model`, `--api-key`, `--base-url`) | per invocation |
+| 1 | CLI flags (`--model`, `--api-key`, `--base-url`, `--temperature`) | per invocation |
 | 2 | Shell environment variables (`export API_KEY=xxx`) | per session |
 | 3 | Local `./.env` file | per project |
 | 4 | Global `~/.mca/.env` file | per user |
@@ -129,6 +127,7 @@ cat > ~/.mca/.env << 'EOF'
 API_KEY=your-api-key-here
 BASE_URL=https://api.openai.com/v1
 MODEL=gpt-4o
+TEMPERATURE=0.3
 EOF
 ```
 
@@ -192,6 +191,7 @@ options:
   -m, --model MODEL      override model name
   -k, --api-key KEY      override API key
   -u, --base-url URL     override API base URL
+  -t, --temperature T    override sampling temperature (default: 0.3)
   -V, --version          show version and exit
 ```
 
@@ -206,6 +206,11 @@ options:
 | `write_file` | Write file (create or overwrite) |
 | `edit_file` | Edit file (text replacement) |
 | `search_files` | Search text across files |
+| `run_command` | Execute a shell command (with confirmation) |
+| `glob` | Find files matching a glob pattern |
+| `create_directory` | Create directory (and parents) |
+| `delete_file` | Delete a file (with confirmation) |
+| `move_file` | Move or rename a file (with confirmation) |
 
 ---
 
@@ -214,24 +219,23 @@ options:
 | Feature | This project | Claude Code / Codex |
 |---------|-------------|---------------------|
 | Agent Loop | basic | advanced (parallel, subtasks) |
-| Tool Calling | 5 tools | more tools (terminal, search, etc.) |
-| Context management | full history | smarter (token management, summaries) |
-| Diff display | basic | richer (syntax highlighting) |
+| Tool Calling | 10 tools | more tools (terminal, search, etc.) |
+| Context management | token tracking + smart summarization | smarter (token management, summaries) |
+| Diff display | unified diff + pygments syntax highlighting | richer (syntax highlighting) |
 | REPL | enhanced (history, completion, search) | full terminal integration |
-| Streaming | no | yes |
+| Streaming | yes (SSE) | yes |
 | Multi-file edit | no | yes |
 | Git integration | no | yes |
-| Code execution | no | yes |
+| Code execution | yes (with confirmation) | yes |
 
 ---
 
 ## Optional dependencies
 
-This project uses progressive enhancement — core functionality depends only on `requests`, optional dependencies unlock extra features:
+This project uses progressive enhancement — core functionality depends on `openai` + `rich`; optional dependencies unlock extra features:
 
 | Dependency | Feature | Install |
 |------------|---------|---------|
-| `rich` | Markdown rendering + styled output | `pip install rich` |
 | `prompt_toolkit` | Enhanced interactive REPL (command history, Tab completion, Ctrl+R search) | `pip install prompt_toolkit` |
 | `tiktoken` | Accurate token counting (OpenAI models) | `pip install tiktoken` |
 | `pygments` | Diff syntax highlighting | `pip install pygments` |
@@ -248,8 +252,8 @@ pip install -r requirements.txt
 
 ## Extension ideas
 
-1. **Streaming**: use SSE for real-time LLM response display
-2. **Code execution tool**: add a `run_command` tool for shell commands
-3. **Multi-file editing**: support editing multiple files in one call
-4. **Git integration**: support viewing diffs, commits, etc.
-5. **Parallel tool calls**: support LLM requesting multiple tool calls in parallel
+1. **Multi-file editing**: support editing multiple files in one call
+2. **Git integration**: support viewing diffs, commits, etc.
+3. **Parallel tool calls**: support LLM requesting multiple tool calls in parallel
+4. **Iteration budget**: smarter tool-loop budgeting based on remaining tokens
+5. **Test verification**: automatically run tests / linters after edits (partially covered by `run_command`)

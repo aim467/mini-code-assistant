@@ -1,7 +1,7 @@
 # Mini Code Assistant 依赖
-# requests: 用于调用 LLM API
+# openai: OpenAI Python SDK，用于调用 LLM API（支持 DeepSeek/Moonshot 等兼容 API）
 # rich: 终端 Markdown 渲染 + 美化输出（可选，缺失时降级为纯文本）
-requests>=2.28.0
+openai>=1.0.0
 rich>=13.0.0
 
 # ── 可选依赖（安装后自动启用额外功能）──────────────────────

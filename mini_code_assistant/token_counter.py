@@ -7,12 +7,13 @@ token_counter.py - Token 计数
   1. 在接近上限时触发智能摘要（而非粗暴裁剪）
   2. 向用户实时展示 token 用量
 
-  两种计数模式：
-  - 精确模式：使用 tiktoken（OpenAI 的 tokenizer），精确计算 token 数
-  - 估算模式：1 token ≈ 3 字符（中英混合粗略值），无需额外依赖
+  计数策略（优先级从高到低）：
+  1. SDK usage 校准：如果 API 返回了 usage 字段（精确值），用它校准累计计数
+  2. tiktoken 精确模式：使用 tiktoken（OpenAI 的 tokenizer）本地计算
+  3. 字符估算模式：1 token ≈ 3 字符（中英混合粗略值），无需额外依赖
 
-  tiktoken 只对 OpenAI 模型精确，对 DeepSeek / Moonshot 等有偏差，
-  但作为触发摘要的阈值判断已经够用。
+  注意：SDK usage 是上一次 API 调用的精确值，但对话可能在本地被修改
+  （如添加工具结果），所以仍需本地估算能力作为补充。
 """
 
 try:

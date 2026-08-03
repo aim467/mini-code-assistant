@@ -355,6 +355,9 @@ def run_agent_loop(llm: LLMClient, tools: ToolSystem, context: Context):
             # ── 流结束 ──────────────────────────────────────
             elif chunk_type == "done":
                 finish_reason = chunk["finish_reason"]
+                # 如果 SDK 返回了精确的 token 用量，更新到 context
+                if chunk.get("usage"):
+                    context.update_usage(chunk["usage"])
 
             # ── 错误 ────────────────────────────────────────
             elif chunk_type == "error":

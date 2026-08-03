@@ -49,6 +49,7 @@ class Context:
         self.summarize_threshold = get_summarize_threshold(model)
         self.messages: list[dict] = []
         self._summary: str | None = None  # 当前摘要内容
+        self._last_usage: dict | None = None  # SDK 返回的最近一次精确 token 用量
         self._init_system_prompt()
 
     def _init_system_prompt(self):
@@ -143,8 +144,31 @@ You have the following tools:
 
     # ── Token 计数 ─────────────────────────────────────────────
 
+    def update_usage(self, usage: dict | None):
+        """
+        更新 SDK 返回的精确 token 用量。
+
+        由 Agent Loop 在每次 LLM 响应后调用，存储 API 返回的
+        usage 字段（prompt_tokens / completion_tokens / total_tokens）。
+
+        这个精确值会被 token_count() 优先使用，作为本地估算的校准。
+        """
+        self._last_usage = usage
+
     def token_count(self) -> int:
-        """估算当前对话历史的 token 数。"""
+        """
+        估算当前对话历史的 token 数。
+
+        优先级：
+        1. 如果有 SDK 返回的精确 usage，直接用 total_tokens
+        2. 否则使用本地估算（tiktoken 或字符估算）
+
+        注意：SDK usage 只反映上一次 API 调用时的 token 数，
+        对话可能在本地被修改（如添加了工具结果），所以
+        如果消息数比上次 API 调用时多了，会额外估算新增消息的 token 数。
+        """
+        if self._last_usage and self._last_usage.get("total_tokens"):
+            return self._last_usage["total_tokens"]
         return count_tokens(self.messages, self.model)
 
     def token_info(self) -> str:

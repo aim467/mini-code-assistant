@@ -2,7 +2,7 @@
 
 一个迷你编程助手，用于学习 Codex / Claude Code / OpenCode 等工具的内部工作原理。
 
-> **设计理念**：代码极简，聚焦核心原理。500 行以内，单一核心依赖（`requests`），可选依赖渐进增强。
+> **设计理念**：代码极简，聚焦核心原理。两个核心依赖（`openai` SDK + `rich`），可选依赖渐进增强。
 
 ---
 
@@ -11,18 +11,18 @@
 ```
 mini-code-assistant/
 ├── pyproject.toml              # 包配置 + console_scripts 入口
-├── requirements.txt            # 依赖（requests + 可选增强）
+├── requirements.txt            # 依赖（openai + rich + 可选增强）
 ├── .env.example                # 配置模板
-├── main.py                     # 向后兼容包装器（可选）
 ├── README.md
 └── mini_code_assistant/        # Python 包
     ├── __init__.py             # 包标记 + __version__
     ├── __main__.py             # `python -m mini_code_assistant` 入口
     ├── cli.py                  # CLI 入口：argparse + REPL + Agent Loop
-    ├── llm.py                  # LLM 客户端：Chat Completions API + Tool Calling
-    ├── tools.py                # 工具系统：文件读/写/编辑/搜索 + 安全机制
-    ├── context.py              # 上下文管理：对话历史 + 系统提示词
-    └── diff.py                 # Diff 展示：difflib + ANSI 颜色
+    ├── llm.py                  # LLM 客户端：OpenAI SDK, Chat Completions + Tool Calling + 流式输出
+    ├── tools.py                # 工具系统：10 个工具（文件操作、搜索、Shell、glob）+ 安全机制
+    ├── context.py              # 上下文管理：对话历史 + 智能摘要
+    ├── token_counter.py        # Token 计数：tiktoken / 估算 + 上下文窗口映射
+    └── diff.py                 # Diff 展示：difflib + ANSI 颜色 + pygments 语法高亮
 ```
 
 ### 核心概念
@@ -32,17 +32,17 @@ mini-code-assistant/
 每个 AI 编程助手的核心——LLM 与工具之间的交互循环：
 
 ```
-用户输入 → 发送给 LLM → LLM 请求工具调用（如读取文件）
+用户输入 → 发送给 LLM（流式）→ LLM 请求工具调用（如读取文件）
   → 执行工具 → 将结果反馈给 LLM → LLM 继续推理
   → 可能调用更多工具 → ... → LLM 给出最终响应
 ```
 
-实现在 `cli.py` → `run_agent_loop()`。
+实现在 `cli.py` → `run_agent_loop()`。响应采用**流式输出**（SSE），你可以实时看到模型的生成过程，无需等待完整响应。
 
 **2. Tool Calling（工具调用）**
 
 LLM 无法直接操作文件系统。通过 OpenAI 的 Tool Calling 机制：
-- 我们在 API 请求中声明可用工具（JSON Schema）
+- 我们在 API 请求中声明 10 个可用工具（JSON Schema）
 - LLM 决定调用某个工具，返回工具名 + 参数
 - 我们执行工具，将结果作为 `role: "tool"` 消息发回
 - LLM 根据结果继续推理
@@ -57,12 +57,15 @@ LLM 是无状态的——每次 API 调用都是独立的。我们维护完整�
 - `assistant`：模型响应（可能包含 tool_calls）
 - `tool`：工具执行结果
 
-实现在 `context.py`。
+当对话接近模型上下文窗口的 ~80% 时，我们使用 LLM 对旧对话轮次进行**智能摘要**（或回退到裁剪），保留最近的对话轮次。Token 用量通过 SDK 的 `usage` 字段 / `tiktoken` / 字符估算来追踪，并通过 `/tokens` 实时显示。
+
+实现在 `context.py` + `token_counter.py`。
 
 **4. Safety（安全机制）**
 - 路径穿越防护：所有文件操作限制在工作目录内
 - 写入确认：任何文件修改前展示 diff
-- 迭代上限：防止无限工具调用循环
+- 命令确认：`run_command` 执行前需用户确认
+- 迭代上限（20 次）：防止无限工具调用循环
 
 ---
 
@@ -72,8 +75,8 @@ LLM 是无状态的——每次 API 调用都是独立的。我们维护完整�
 
 ```bash
 cd mini-code-assistant
-pip install -e .          # 基础安装
-pip install -e ".[full]"  # 完整安装（含增强 REPL、Token 计数、语法高亮）
+pip install -e .          # 基础安装（openai + rich）
+pip install -e ".[full]"  # 完整安装（增强 REPL、Token 计数、语法高亮）
 ```
 
 这会在系统 PATH 中注册 `mca` 命令。安装后可在任意位置运行：
@@ -83,6 +86,7 @@ mca                          # 在当前目录运行
 mca /path/to/project         # 在指定目录运行
 mca --model deepseek-chat    # 覆盖模型
 mca --api-key sk-xxx         # 覆盖 API Key
+mca --temperature 0.0        # 覆盖采样温度
 mca --version                # 显示版本
 ```
 
@@ -99,12 +103,6 @@ pip install -r requirements.txt
 python -m mini_code_assistant [目录] [选项]
 ```
 
-### 方式 C：直接运行（向后兼容）
-
-```bash
-python main.py [目录]
-```
-
 ---
 
 ## 配置
@@ -113,7 +111,7 @@ python main.py [目录]
 
 | 优先级 | 来源 | 作用域 |
 |--------|------|--------|
-| 1 | CLI 参数（`--model`、`--api-key`、`--base-url`） | 单次调用 |
+| 1 | CLI 参数（`--model`、`--api-key`、`--base-url`、`--temperature`） | 单次调用 |
 | 2 | Shell 环境变量（`export API_KEY=xxx`） | 当前会话 |
 | 3 | 本地 `./.env` 文件 | 当前项目 |
 | 4 | 全局 `~/.mca/.env` 文件 | 当前用户 |
@@ -129,6 +127,7 @@ cat > ~/.mca/.env << 'EOF'
 API_KEY=your-api-key-here
 BASE_URL=https://api.openai.com/v1
 MODEL=gpt-4o
+TEMPERATURE=0.3
 EOF
 ```
 
@@ -192,6 +191,7 @@ mca [目录] [选项]
   -m, --model MODEL      覆盖模型名称
   -k, --api-key KEY      覆盖 API Key
   -u, --base-url URL     覆盖 API 基础 URL
+  -t, --temperature T    覆盖采样温度（默认：0.3）
   -V, --version          显示版本并退出
 ```
 
@@ -206,6 +206,11 @@ mca [目录] [选项]
 | `write_file` | 写入文件（创建或覆盖） |
 | `edit_file` | 编辑文件（文本替换） |
 | `search_files` | 跨文件搜索文本 |
+| `run_command` | 执行 Shell 命令（需确认） |
+| `glob` | 按 glob 模式查找文件 |
+| `create_directory` | 创建目录（含父目录） |
+| `delete_file` | 删除文件（需确认） |
+| `move_file` | 移动或重命名文件（需确认） |
 
 ---
 
@@ -214,24 +219,23 @@ mca [目录] [选项]
 | 特性 | 本项目 | Claude Code / Codex |
 |------|--------|---------------------|
 | Agent Loop | 基础 | 高级（并行、子任务） |
-| Tool Calling | 5 个工具 | 更多工具（终端、搜索等） |
-| 上下文管理 | 完整历史 | 更智能（Token 管理、摘要） |
-| Diff 展示 | 基础 | 更丰富（语法高亮） |
+| Tool Calling | 10 个工具 | 更多工具（终端、搜索等） |
+| 上下文管理 | Token 追踪 + 智能摘要 | 更智能（Token 管理、摘要） |
+| Diff 展示 | 统一 diff + pygments 语法高亮 | 更丰富（语法高亮） |
 | REPL | 增强（历史、补全、搜索） | 完整终端集成 |
-| 流式输出 | 不支持 | 支持 |
+| 流式输出 | 支持（SSE） | 支持 |
 | 多文件编辑 | 不支持 | 支持 |
 | Git 集成 | 不支持 | 支持 |
-| 代码执行 | 不支持 | 支持 |
+| 代码执行 | 支持（需确认） | 支持 |
 
 ---
 
 ## 可选依赖
 
-本项目采用渐进增强设计——核心功能仅依赖 `requests`，安装可选依赖后自动启用额外功能：
+本项目采用渐进增强设计——核心功能依赖 `openai` + `rich`；可选依赖解锁额外功能：
 
 | 依赖 | 功能 | 安装方式 |
 |------|------|----------|
-| `rich` | Markdown 渲染 + 美化输出 | `pip install rich` |
 | `prompt_toolkit` | 增强交互式 REPL（命令历史、Tab 补全、Ctrl+R 搜索） | `pip install prompt_toolkit` |
 | `tiktoken` | 精确 Token 计数（OpenAI 模型） | `pip install tiktoken` |
 | `pygments` | Diff 语法高亮 | `pip install pygments` |
@@ -248,8 +252,8 @@ pip install -r requirements.txt
 
 ## 扩展思路
 
-1. **流式输出**：使用 SSE 实时展示 LLM 响应
-2. **代码执行工具**：添加 `run_command` 工具用于执行 Shell 命令
-3. **多文件编辑**：支持一次调用中编辑多个文件
-4. **Git 集成**：支持查看 diff、提交等操作
-5. **并行工具调用**：支持 LLM 一次请求多个工具调用并行执行
+1. **多文件编辑**：支持一次调用中编辑多个文件
+2. **Git 集成**：支持查看 diff、提交等操作
+3. **并行工具调用**：支持 LLM 一次请求多个工具调用并行执行
+4. **迭代预算**：基于剩余 Token 更智能地分配工具循环预算
+5. **测试验证**：编辑后自动运行测试 / Linter（`run_command` 已部分覆盖）

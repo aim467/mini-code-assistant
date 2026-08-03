@@ -1,12 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-llm.py - LLM API 客户端
+llm.py - LLM API 客户端（基于 OpenAI Python SDK）
 
 核心原理：
-  编程助手的大脑是一个 LLM（大语言模型）。我们通过 HTTP 调用
-  OpenAI 兼容的 Chat Completions API，发送对话历史和工具定义，
-  模型返回文本回复或工具调用请求。
+  编程助手的大脑是一个 LLM（大语言模型）。我们通过 OpenAI 兼容的
+  Chat Completions API，发送对话历史和工具定义，模型返回文本回复或
+  工具调用请求。
 
-  这里的关键概念是 **Tool Calling（工具调用）**：
+  关键概念是 **Tool Calling（工具调用）**：
   - 我们在请求中声明一组工具（函数）及其参数 schema
   - 模型可以决定调用某个工具，返回工具名和参数
   - 我们执行工具，把结果喂回模型
@@ -15,13 +17,18 @@ llm.py - LLM API 客户端
   这个"请求 → 工具调用 → 执行 → 喂回 → 继续"的循环，
   就是所有 AI 编程助手的核心工作模式（Agent Loop）。
 
-  本模块提供两种调用方式：
-  - chat(): 非流式调用，等待完整响应后返回。适合不需要实时显示的场景。
-  - chat_stream(): 流式调用（SSE），逐块返回响应增量。适合实时显示 LLM 输出。
+  本模块使用 OpenAI Python SDK（openai 库）替代原始 HTTP 请求：
+  - SDK 内置 SSE 流式解析，无需手写
+  - SDK 内置错误重试、超时处理
+  - SDK 返回结构化对象，工具调用解析更可靠
+  - SDK 的 usage 字段提供精确的 token 计数
+
+  支持两种调用方式：
+  - chat(): 非流式调用，等待完整响应后返回
+  - chat_stream(): 流式调用，逐块返回响应增量
 """
 
-import json
-import requests
+from openai import OpenAI, APITimeoutError, APIConnectionError, APIStatusError
 
 
 class LLMClient:
@@ -35,8 +42,13 @@ class LLMClient:
             model:        模型名称（如 gpt-4o, deepseek-chat 等）
             temperature:  采样温度，编程任务推荐低值（默认 0.3）
         """
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        # 使用 OpenAI SDK 客户端，通过 base_url 兼容 DeepSeek / Moonshot 等
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url.rstrip("/"),
+            timeout=120.0,  # LLM 响应可能较慢，给足时间
+            max_retries=2,  # 自动重试 2 次
+        )
         self.model = model
         self.temperature = temperature
 
@@ -52,11 +64,11 @@ class LLMClient:
             {
                 "content": str,          # 模型的文本回复
                 "tool_calls": list,      # 模型请求的工具调用列表
-                "finish_reason": str     # 结束原因
+                "finish_reason": str,    # 结束原因
+                "usage": dict | None,    # token 用量（prompt_tokens, completion_tokens, total_tokens）
             }
         """
-        # ── 构建请求体 ────────────────────────────────────────
-        payload = {
+        kwargs = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
@@ -64,52 +76,62 @@ class LLMClient:
 
         # 如果提供了工具定义，加入请求
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"  # 让模型自己决定是否调用工具
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"  # 让模型自己决定是否调用工具
 
-        # ── 发送 HTTP 请求 ───────────────────────────────────
-        # 这里直接用 requests，不依赖 openai SDK，便于理解底层交互
+        # ── 发送请求 ────────────────────────────────────────
+        # SDK 自动处理超时、重试和 HTTP 错误
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=120,  # LLM 响可能较慢，给足时间
-            )
-            resp.raise_for_status()
-        except requests.exceptions.ConnectionError:
+            response = self.client.chat.completions.create(**kwargs)
+        except APIConnectionError:
             return {
                 "content": "[错误] 无法连接到 API 服务器，请检查 base_url 和网络。",
                 "tool_calls": [],
                 "finish_reason": "error",
+                "usage": None,
             }
-        except requests.exceptions.Timeout:
+        except APITimeoutError:
             return {
                 "content": "[错误] API 请求超时。",
                 "tool_calls": [],
                 "finish_reason": "error",
+                "usage": None,
             }
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code
-            body = e.response.text[:200]
+        except APIStatusError as e:
             return {
-                "content": f"[错误] API 返回 {status}: {body}",
+                "content": f"[错误] API 返回 {e.status_code}: {e.message[:200]}",
                 "tool_calls": [],
                 "finish_reason": "error",
+                "usage": None,
             }
 
-        # ── 解析响应 ──────────────────────────────────────────
-        data = resp.json()
-        choice = data["choices"][0]
-        message = choice["message"]
+        # ── 解析响应 ────────────────────────────────────────
+        # SDK 返回结构化对象，无需手动解析 JSON
+        choice = response.choices[0]
+        message = choice.message
+
+        # 将 SDK 的 tool_calls 对象转为 dict 列表，保持与原有代码兼容
+        tool_calls = []
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                tool_calls.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                })
 
         return {
-            "content": message.get("content") or "",
-            "tool_calls": message.get("tool_calls") or [],
-            "finish_reason": choice["finish_reason"],
+            "content": message.content or "",
+            "tool_calls": tool_calls,
+            "finish_reason": choice.finish_reason,
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            } if response.usage else None,
         }
 
     def chat_stream(self, messages: list, tools: list = None):
@@ -119,19 +141,7 @@ class LLMClient:
         与 chat() 不同，此方法通过 HTTP 流式传输实时返回 LLM 的输出，
         用户可以立即看到模型的生成过程，而不必等待完整响应。
 
-        核心原理：
-          OpenAI 兼容 API 支持 stream=True 参数。开启后，响应不再是
-          一次性返回的 JSON，而是分块发送的 SSE 事件流：
-
-            data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
-            data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}
-            data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
-            data: [DONE]
-
-          每个 chunk 包含一个 delta（增量）对象：
-          - delta.content: 文本增量片段
-          - delta.tool_calls: 工具调用增量片段（分多次发送）
-          - finish_reason: 结束原因（"stop" / "tool_calls" / null）
+        SDK 自动处理 SSE 解析，我们只需遍历 stream 对象即可。
 
         参数:
             messages: 对话历史
@@ -144,100 +154,72 @@ class LLMClient:
             {"type": "done", "finish_reason": "..."}             - 流结束
             {"type": "error", "content": "..."}                  - 错误
         """
-        # ── 构建请求体 ────────────────────────────────────────
-        payload = {
+        kwargs = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "stream": True,  # 关键：启用流式传输
+            "stream_options": {"include_usage": True},  # 请求流式响应包含 token 用量
         }
 
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-        # ── 发送流式 HTTP 请求 ────────────────────────────────
+        # ── 发送流式请求 ────────────────────────────────────
+        # SDK 内置 SSE 解析，无需手写逐行解析逻辑
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=120,
-                stream=True,  # 关键：不等待完整响应，逐块读取
-            )
-            resp.raise_for_status()
-        except requests.exceptions.ConnectionError:
+            stream = self.client.chat.completions.create(**kwargs)
+        except APIConnectionError:
             yield {"type": "error", "content": "[错误] 无法连接到 API 服务器，请检查 base_url 和网络。"}
             return
-        except requests.exceptions.Timeout:
+        except APITimeoutError:
             yield {"type": "error", "content": "[错误] API 请求超时。"}
             return
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code
-            body = e.response.text[:200]
-            yield {"type": "error", "content": f"[错误] API 返回 {status}: {body}"}
+        except APIStatusError as e:
+            yield {"type": "error", "content": f"[错误] API 返回 {e.status_code}: {e.message[:200]}"}
             return
 
-        # ── 解析 SSE 事件流 ───────────────────────────────────
-        # SSE 格式：每行以 "data: " 开头，空行分隔事件
-        # 结束标记：data: [DONE]
-        for line in resp.iter_lines(decode_unicode=True):
-            # 跳过空行和注释行（SSE 注释以冒号开头，如 ": keep-alive"）
-            if not line or line.startswith(":"):
+        # ── 遍历流式响应 ────────────────────────────────────
+        # SDK 已将 SSE 事件解析为结构化对象，直接访问字段即可
+        for chunk in stream:
+            if not chunk.choices:
                 continue
 
-            # SSE 数据行以 "data: " 开头
-            if not line.startswith("data: "):
-                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason
 
-            data = line[6:]  # 去掉 "data: " 前缀
+            # ── 文本增量 ──────────────────────────────────
+            if delta.content:
+                yield {"type": "text_delta", "content": delta.content}
 
-            # 流结束标记
-            if data.strip() == "[DONE]":
-                yield {"type": "done", "finish_reason": "stop"}
-                return
-
-            # 解析 JSON 数据
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-            # 提取 delta 和 finish_reason
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = choice.get("delta", {})
-            finish_reason = choice.get("finish_reason")
-
-            # ── 文本增量 ──────────────────────────────────────
-            content_delta = delta.get("content")
-            if content_delta:
-                yield {"type": "text_delta", "content": content_delta}
-
-            # ── 工具调用增量 ──────────────────────────────────
-            # 流式工具调用分多次发送：
-            #   第一个 chunk: 包含 id、type、function.name
-            #   后续 chunks: 只包含 function.arguments 的片段
-            tool_call_deltas = delta.get("tool_calls")
-            if tool_call_deltas:
-                for tc_delta in tool_call_deltas:
-                    func_delta = tc_delta.get("function", {})
+            # ── 工具调用增量 ──────────────────────────────
+            # SDK 将流式工具调用解析为结构化对象
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
                     yield {
                         "type": "tool_call_delta",
-                        "index": tc_delta.get("index", 0),
-                        "id": tc_delta.get("id"),
-                        "name": func_delta.get("name"),
-                        "arguments_delta": func_delta.get("arguments", ""),
+                        "index": tc.index,
+                        "id": tc.id,
+                        "name": tc.function.name if tc.function else None,
+                        "arguments_delta": tc.function.arguments if tc.function else "",
                     }
 
-            # ── 流结束 ────────────────────────────────────────
+            # ── 流结束 ────────────────────────────────────
             if finish_reason:
-                yield {"type": "done", "finish_reason": finish_reason}
+                # 尝试获取 usage（需要 stream_options 包含 include_usage）
+                usage_info = None
+                if chunk.usage:
+                    usage_info = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
+                    }
+                done_event = {"type": "done", "finish_reason": finish_reason}
+                if usage_info:
+                    done_event["usage"] = usage_info
+                yield done_event
                 return
 
         # 如果流意外结束（没有收到 finish_reason），发送 done 事件
@@ -282,28 +264,16 @@ class LLMClient:
             f"Conversation to summarize:\n{transcript}"
         )
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful conversation summarizer."},
-                {"role": "user", "content": summary_prompt},
-            ],
-            "temperature": 0.0,  # 摘要需要确定性
-        }
-
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful conversation summarizer."},
+                    {"role": "user", "content": summary_prompt},
+                ],
+                temperature=0.0,  # 摘要需要确定性
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"] or ""
+            return response.choices[0].message.content or ""
         except Exception:
             # 摘要失败时回退：返回一个简单的截断提示
             return (

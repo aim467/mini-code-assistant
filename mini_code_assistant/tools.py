@@ -257,7 +257,10 @@ class ToolSystem:
         所有真实编程助手都有类似的安全检查。
         """
         full = (self.working_dir / path).resolve()
-        if not str(full).startswith(str(self.working_dir)):
+        # 用路径边界判断（而非字符串前缀），防止 "../sibling" 这类路径穿越绕过沙箱
+        try:
+            full.relative_to(self.working_dir)
+        except ValueError:
             raise ValueError(f"Path escapes working directory: {path}")
         return full
 
@@ -344,9 +347,13 @@ class ToolSystem:
         """写入文件（创建或覆盖），会先展示内容再请求确认。"""
         target = self._safe_path(path)
 
+        # 检测已有文件的换行符风格，避免写入时把 LF 文件整体改成 CRLF（Windows 专属坑）
+        crlf = False
         if target.exists():
             # 文件已存在，展示 diff
-            old_content = target.read_text(encoding="utf-8")
+            old_raw = target.read_text(encoding="utf-8", newline="")
+            crlf = "\r\n" in old_raw
+            old_content = old_raw.replace("\r\n", "\n")  # 归一化为 LF 用于 diff
             print(f"\n  [WRITE] {path} will be overwritten:")
             show_diff(old_content, content, path)
         else:
@@ -358,8 +365,16 @@ class ToolSystem:
             return "Operation cancelled"
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return f"File written: {path} ({len(content)} chars)"
+
+        # 覆盖已有文件时保持原先的换行符风格；新文件则保持 LLM 提供的内容不变
+        if crlf:
+            to_write = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        else:
+            to_write = content
+
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(to_write)
+        return f"File written: {path} ({len(to_write)} chars)"
 
     def _tool_edit_file(self, path: str, old_text: str, new_text: str) -> str:
         """编辑文件：将 old_text 替换为 new_text，会先展示 diff 再请求确认。"""
@@ -367,7 +382,10 @@ class ToolSystem:
         if not target.exists():
             return f"Error: file does not exist: {path}"
 
-        content = target.read_text(encoding="utf-8")
+        # 用 newline="" 保留原始换行符用于检测，再归一化为 LF 用于匹配
+        raw = target.read_text(encoding="utf-8", newline="")
+        crlf = "\r\n" in raw
+        content = raw.replace("\r\n", "\n")  # 归一化为 LF，确保 old_text（通常是 LF）能匹配
 
         # 检查 old_text 是否存在
         count = content.count(old_text)
@@ -376,17 +394,20 @@ class ToolSystem:
         if count > 1:
             return f"Error: old_text appears {count} times in file. Please provide more specific text to match uniquely."
 
-        # 生成新内容
+        # 生成新内容（LF）
         new_content = content.replace(old_text, new_text)
 
-        # 展示 diff
+        # 展示 diff（统一用 LF，避免换行符差异污染 diff 显示）
         print(f"\n  [EDIT] {path} will be modified:")
         show_diff(content, new_content, path)
 
         if not self._confirm("Confirm edit?"):
             return "Operation cancelled"
 
-        target.write_text(new_content, encoding="utf-8")
+        # 写回时保持原文件的换行符风格
+        to_write = new_content.replace("\n", "\r\n") if crlf else new_content
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(to_write)
         return f"File edited: {path}"
 
     def _tool_search_files(self, pattern: str, path: str = ".") -> str:
@@ -557,7 +578,7 @@ class ToolSystem:
         if not target.exists():
             return f"Error: file does not exist: {path}"
         if target.is_dir():
-            return f"Error: path is a directory, not a file: {path}. Use remove_directory if needed."
+            return f"Error: path is a directory, not a file: {path}. To remove a directory, use run_command (e.g. 'rm -rf' on Unix or 'rmdir /s /q' on Windows)."
 
         size = target.stat().st_size
         print(f"\n  {Color.RED}[DELETE]{Color.RESET} {path}  ({size} bytes)")
