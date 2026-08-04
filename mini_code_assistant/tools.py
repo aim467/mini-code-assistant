@@ -25,8 +25,10 @@ import logging
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from .diff import show_diff, show_new_file, Color
+from .mcp import MCPManager
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +36,14 @@ logger = logging.getLogger(__name__)
 class ToolSystem:
     """工具定义与执行系统。"""
 
-    def __init__(self, working_dir: str):
+    def __init__(self, working_dir: str, mcp_manager: Optional[MCPManager] = None):
         self.working_dir = Path(working_dir).resolve()
+        self.mcp_manager = mcp_manager
         # 工具定义列表，会发给 LLM
         self.definitions = self._build_definitions()
+        # 合并 MCP Server 暴露的工具定义（LLM 无感来源）
+        if self.mcp_manager is not None:
+            self.definitions += self.mcp_manager.tool_definitions()
 
     # ── 工具定义（发给 LLM 的 schema）──────────────────────────
     def _build_definitions(self) -> list:
@@ -289,7 +295,14 @@ class ToolSystem:
 
         根据 tool_name 找到对应的处理方法并执行。
         所有工具都返回字符串（LLM 只能处理文本）。
+
+        MCP 工具（名为 mcp__<server>__<tool>）优先路由到 MCPManager；
+        其余走内置 handler。
         """
+        # MCP 工具优先路由（命名空间前缀）
+        if self.mcp_manager is not None and tool_name.startswith("mcp__"):
+            return self.mcp_manager.call(tool_name, arguments)
+
         # 工具名 → 处理方法的映射
         handlers = {
             "list_files": self._tool_list_files,
@@ -323,7 +336,7 @@ class ToolSystem:
         if not target.is_dir():
             return f"Error: not a directory: {path}"
 
-        ignore = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode", ".mca"}
+        ignore = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode", ".mca", ".gitignore"}
         entries = []
         for item in sorted(target.iterdir()):
             if item.name in ignore:

@@ -47,6 +47,7 @@ from .llm import LLMClient
 from .tools import ToolSystem
 from .context import Context
 from .token_counter import format_token_count, HAS_TIKTOKEN
+from .mcp import MCPManager, MCPServerConfig
 from . import __version__
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,28 @@ def _parse_env_file(path: Path, config: dict):
             config[key.strip()] = value.strip().strip('"').strip("'")
 
 
+# ── MCP 配置加载器 ─────────────────────────────────────────────
+# 从 ~/.mca/mcp.json 读取 MCP Server 列表（全局配置）
+def load_mcp_config() -> list:
+    """
+    从 ~/.mca/mcp.json 加载 MCP Server 配置。
+
+    返回 MCPServerConfig 列表；文件不存在 / 解析失败则返回空列表。
+    """
+    path = Path.home() / ".mca" / "mcp.json"
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"[mcp] failed to read {path}: {e}")
+        return []
+    if not isinstance(raw, list):
+        logger.error(f"[mcp] {path} must be a JSON array of server configs")
+        return []
+    return [MCPServerConfig.from_dict(item) for item in raw]
+
+
 # ── 终端颜色 ───────────────────────────────────────────────────
 class C:
     """ANSI 颜色码简写。"""
@@ -208,6 +231,7 @@ def print_help():
             "  [yellow]/clear[/]    clear conversation history\n"
             "  [yellow]/files[/]    list files in workdir\n"
             "  [yellow]/tokens[/]   show token usage\n"
+            "  [yellow]/mcp[/]      list connected MCP servers and their tools\n"
             f"{repl_hint}\n"
             "[bold]Usage:[/]\n"
             "  Just type your question or task, e.g.:\n"
@@ -224,6 +248,7 @@ def print_help():
         print(f"  {C.YELLOW}/clear{C.RESET}    clear conversation history")
         print(f"  {C.YELLOW}/files{C.RESET}    list files in workdir")
         print(f"  {C.YELLOW}/tokens{C.RESET}   show token usage")
+        print(f"  {C.YELLOW}/mcp{C.RESET}      list connected MCP servers and their tools")
         if HAS_PROMPT_TOOLKIT:
             print(f"  {C.DIM}--------------------------------------{C.RESET}")
             print(f"  {C.BOLD}REPL Shortcuts:{C.RESET}")
@@ -240,28 +265,31 @@ def print_help():
 
 # ── prompt_toolkit 增强交互 ──────────────────────────────────
 # 命令补全器：为 /help, /exit 等斜杠命令提供 Tab 补全
-class SlashCommandCompleter(Completer):
-    """斜杠命令补全器，支持 Tab 自动补全。"""
+# 仅当 prompt_toolkit 可用时才定义（否则 Completer 未导入，定义会抛 NameError）
+if HAS_PROMPT_TOOLKIT:
+    class SlashCommandCompleter(Completer):
+        """斜杠命令补全器，支持 Tab 自动补全。"""
 
-    COMMANDS = {
-        "/help": "show this help",
-        "/exit": "quit",
-        "/clear": "clear conversation history",
-        "/files": "list files in workdir",
-        "/tokens": "show token usage",
-    }
+        COMMANDS = {
+            "/help": "show this help",
+            "/exit": "quit",
+            "/clear": "clear conversation history",
+            "/files": "list files in workdir",
+            "/tokens": "show token usage",
+            "/mcp": "list connected MCP servers and their tools",
+        }
 
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        # 只在输入以 / 开头时触发补全
-        if text.startswith("/"):
-            for cmd, desc in self.COMMANDS.items():
-                if cmd.startswith(text):
-                    yield Completion(
-                        cmd,
-                        start_position=-len(text),
-                        display=f"{cmd}  ({desc})",
-                    )
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # 只在输入以 / 开头时触发补全
+            if text.startswith("/"):
+                for cmd, desc in self.COMMANDS.items():
+                    if cmd.startswith(text):
+                        yield Completion(
+                            cmd,
+                            start_position=-len(text),
+                            display=f"{cmd}  ({desc})",
+                        )
 
 
 def create_prompt_session() -> "PromptSession | None":
@@ -549,10 +577,20 @@ def main():
 
     # 初始化核心组件
     llm = LLMClient(api_key, base_url, model, temperature=temperature)
-    tools = ToolSystem(working_dir)
+    mcp_manager = MCPManager(load_mcp_config())
+    tools = ToolSystem(working_dir, mcp_manager=mcp_manager)
     context = Context(working_dir, llm=llm, model=model)
 
     print_banner(working_dir, model, context.context_limit)
+
+    # MCP 连接状态提示
+    if mcp_manager.conns:
+        logger.info(f"[mcp] {len(mcp_manager.conns)} MCP server(s) connected")
+    if mcp_manager.failed:
+        logger.warning(
+            f"[mcp] {len(mcp_manager.failed)} MCP server(s) failed to start: "
+            + ", ".join(mcp_manager.failed.keys())
+        )
 
     # ── 创建增强 REPL 会话（如果 prompt_toolkit 可用）────
     session = create_prompt_session()
@@ -615,6 +653,34 @@ def main():
                         print(f"  {C.DIM}(context has been auto-summarized){C.RESET}")
                 print()
                 continue
+            elif cmd == "/mcp":
+                servers = mcp_manager.list_servers()
+                if not servers:
+                    if HAS_RICH:
+                        _console.print("[dim]No MCP servers connected.[/]")
+                    else:
+                        print("  No MCP servers connected.")
+                    if mcp_manager.failed:
+                        failed = ", ".join(
+                            f"{k} ({v})" for k, v in mcp_manager.failed.items()
+                        )
+                        if HAS_RICH:
+                            _console.print(f"[yellow]Failed:[/] {failed}")
+                        else:
+                            print(f"  Failed: {failed}")
+                    print()
+                else:
+                    if HAS_RICH:
+                        for s, ts in servers.items():
+                            _console.print(f"[bold]{s}[/]: {', '.join(ts)}")
+                    else:
+                        for s, ts in servers.items():
+                            print(f"  [MCP] {s}: {', '.join(ts)}")
+                    if mcp_manager.failed:
+                        failed = ", ".join(mcp_manager.failed.keys())
+                        print(f"  (failed: {failed})")
+                    print()
+                continue
             else:
                 if HAS_RICH:
                     _console.print(f"[yellow]Unknown command: {user_input}[/]")
@@ -630,6 +696,12 @@ def main():
             logger.warning("Task interrupted.")
         except Exception as e:
             logger.exception(f"Unexpected error: {e}")
+
+    # 程序退出前清理所有 MCP 子进程（关 stdin → wait → kill）
+    try:
+        mcp_manager.close_all()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
