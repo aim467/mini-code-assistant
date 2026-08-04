@@ -6,4 +6,4 @@ Mini Code Assistant - 基础编程助手
 等工具的核心实现原理。
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"

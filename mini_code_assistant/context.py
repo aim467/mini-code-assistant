@@ -247,14 +247,21 @@ You have the following tools:
         """
         无 LLM 时的回退策略：按轮次删除最早的消息。
 
-        删除策略：按"轮次"删除，一轮从 user 消息开始到下一个 user 消息之前。
-        这样保证删除后剩余消息仍构成有效的 API 对话序列：
+        关键修复（v0.2.1）：使用本地估算计数 `count_tokens()` 而非 `token_count()`。
+        原 `token_count()` 在存在 SDK `usage` 缓存时会返回上一次 API 调用的
+        total_tokens——该值不会随本地删除消息而减少，导致裁剪循环永不收敛，
+        最终把对话几乎删空（过度裁剪）。
+
+        删除策略：按"轮次"整段删除，一轮从 user 消息开始到下一个 user 消息之前。
+        这样保证 tool_call 与其对应的 tool 结果始终成对删除，不会在 API 侧
+        留下悬空引用（tool result 找不到对应的 tool_call）：
           system → user → assistant [→ tool → assistant] → user → ...
         """
-        while (
-            len(self.messages) > 2
-            and self.token_count() > self.summarize_threshold
-        ):
+        while len(self.messages) > 2:
+            # 用本地估算（会随消息删除而真实下降），不要依赖可能过期的 SDK 缓存
+            if count_tokens(self.messages, self.model) <= self.summarize_threshold:
+                break
+
             user_indices = [
                 i for i, m in enumerate(self.messages) if m["role"] == "user"
             ]

@@ -39,6 +39,7 @@ cli.py - Mini Code Assistant 命令行入口
 import os
 import sys
 import json
+import logging
 import argparse
 from pathlib import Path
 
@@ -47,6 +48,31 @@ from .tools import ToolSystem
 from .context import Context
 from .token_counter import format_token_count, HAS_TIKTOKEN
 from . import __version__
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging():
+    """
+    配置全局 logging。
+
+    - 级别由环境变量 MCA_LOG_LEVEL 控制（默认 INFO，可选 DEBUG/WARNING/ERROR）
+    - 输出到 stderr，避免污染 stdout 上的应用内容（流式回复、diff 等）
+    - 结构化格式：时间 [级别] 模块: 消息
+    """
+    level_name = os.getenv("MCA_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
+    # 抑制 httpx/httpcore 的请求日志
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 # ── Rich 可选依赖 ────────────────────────────────────────────
 # 如果安装了 rich，用 Markdown 渲染 + 面板展示；否则降级为纯文本
@@ -362,10 +388,7 @@ def run_agent_loop(llm: LLMClient, tools: ToolSystem, context: Context):
             # ── 错误 ────────────────────────────────────────
             elif chunk_type == "error":
                 has_error = True
-                if HAS_RICH:
-                    _console.print(f"\n  [yellow]{chunk['content']}[/]")
-                else:
-                    print(f"\n  {C.YELLOW}{chunk['content']}{C.RESET}")
+                logger.error(f"LLM stream error: {chunk['content']}")
                 return
 
         # 流式输出结束，换行
@@ -428,10 +451,7 @@ def run_agent_loop(llm: LLMClient, tools: ToolSystem, context: Context):
             context.add_tool_result(tc["id"], result)
 
     # 达到最大迭代次数
-    if HAS_RICH:
-        _console.print(f"\n  [yellow]Max iterations ({MAX_ITERATIONS}) reached.[/]")
-    else:
-        print(f"\n  {C.YELLOW}Max iterations ({MAX_ITERATIONS}) reached.{C.RESET}")
+    logger.warning(f"Max iterations ({MAX_ITERATIONS}) reached.")
     _print_token_usage(context, msg_count_before)
 
 
@@ -461,6 +481,9 @@ def _print_token_usage(context: Context, msg_count_before: int):
 
 # ── 主函数 ─────────────────────────────────────────────────────
 def main():
+    # ── 配置日志 ────────────────────────────────────────────
+    setup_logging()
+
     # ── 解析命令行参数 ──────────────────────────────────────
     parser = argparse.ArgumentParser(
         prog="mca",
@@ -513,16 +536,15 @@ def main():
     # 工作目录
     working_dir = Path(args.directory).resolve()
     if not working_dir.exists():
-        print(f"Error: working directory does not exist: {working_dir}")
+        logger.error(f"working directory does not exist: {working_dir}")
         sys.exit(1)
 
     if not api_key:
-        print("Error: API_KEY is required.")
-        print("\nYou can configure it via:")
-        print("  1. CLI flag:   mca --api-key sk-xxx")
-        print("  2. Local env:  create .env in current directory")
-        print("  3. Global env: create ~/.mca/.env")
-        print("  4. Shell env:  export API_KEY=sk-xxx")
+        logger.error("API_KEY is required.")
+        logger.error(
+            "Configure via: CLI flag (mca --api-key sk-xxx), local ./.env, "
+            "global ~/.mca/.env, or shell env (export API_KEY=sk-xxx)"
+        )
         sys.exit(1)
 
     # 初始化核心组件
@@ -605,15 +627,9 @@ def main():
         try:
             run_agent_loop(llm, tools, context)
         except KeyboardInterrupt:
-            if HAS_RICH:
-                _console.print("[yellow]Task interrupted.[/]")
-            else:
-                print(f"\n{C.YELLOW}Task interrupted.{C.RESET}")
+            logger.warning("Task interrupted.")
         except Exception as e:
-            if HAS_RICH:
-                _console.print(f"[yellow]Error: {e}[/]")
-            else:
-                print(f"\n{C.YELLOW}Error: {e}{C.RESET}")
+            logger.exception(f"Unexpected error: {e}")
 
 
 if __name__ == "__main__":

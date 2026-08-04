@@ -21,10 +21,14 @@ tools.py - 工具系统
 
 import os
 import json
+import logging
+import shlex
 import subprocess
 from pathlib import Path
 
 from .diff import show_diff, show_new_file, Color
+
+logger = logging.getLogger(__name__)
 
 
 class ToolSystem:
@@ -69,14 +73,22 @@ class ToolSystem:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read the full content of a file. Always read before modifying.",
+                    "description": "Read the content of a file. Always read before modifying. For large files use offset/limit to read in chunks.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
                                 "description": "File path relative to working directory",
-                            }
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Character offset to start reading from (default 0). Use with limit for large files.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of characters to return (default 32000).",
+                            },
                         },
                         "required": ["path"],
                     },
@@ -153,7 +165,7 @@ class ToolSystem:
                 "type": "function",
                 "function": {
                     "name": "run_command",
-                    "description": "Execute a shell command and return its output. Use for running tests, builds, linters, or any command-line tool. Requires user confirmation.",
+                    "description": "Execute a command-line tool (e.g. tests, builds, linters) and return its output. Runs WITHOUT a shell for safety (no pipes, redirects, or && chaining). Requires user confirmation.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -324,8 +336,8 @@ class ToolSystem:
 
         return f"Directory {path}:\n" + "\n".join(entries) if entries else f"Directory {path} is empty"
 
-    def _tool_read_file(self, path: str) -> str:
-        """读取文件内容。"""
+    def _tool_read_file(self, path: str, offset: int = 0, limit: int = 32000) -> str:
+        """读取文件内容，支持分段读取（offset/limit）以处理大文件。"""
         target = self._safe_path(path)
         if not target.exists():
             return f"Error: file does not exist: {path}"
@@ -337,11 +349,23 @@ class ToolSystem:
         except UnicodeDecodeError:
             return f"Error: cannot read file (possibly binary): {path}"
 
-        # 限制返回长度，避免占用过多 token
-        max_chars = 8000
-        if len(content) > max_chars:
-            content = content[:max_chars] + f"\n\n...(file truncated, total {len(content)} chars)"
-        return content
+        total = len(content)
+        offset = max(0, int(offset))
+        limit = max(1, int(limit))
+        end = min(offset + limit, total)
+        chunk = content[offset:end]
+
+        # 仅当文件被分段时才加提示，帮助 LLM 理解当前读取位置
+        if offset > 0 or end < total:
+            parts = [f"[showing chars {offset}-{end} of {total}]"]
+            if offset > 0:
+                parts.append("...(file begins before this)")
+            parts.append(chunk)
+            if end < total:
+                parts.append(f"...(file continues, total {total} chars)")
+            return "\n".join(parts)
+
+        return chunk
 
     def _tool_write_file(self, path: str, content: str) -> str:
         """写入文件（创建或覆盖），会先展示内容再请求确认。"""
@@ -354,11 +378,11 @@ class ToolSystem:
             old_raw = target.read_text(encoding="utf-8", newline="")
             crlf = "\r\n" in old_raw
             old_content = old_raw.replace("\r\n", "\n")  # 归一化为 LF 用于 diff
-            print(f"\n  [WRITE] {path} will be overwritten:")
+            logger.info(f"[WRITE] {path} will be overwritten:")
             show_diff(old_content, content, path)
         else:
             # 新文件，展示内容
-            print(f"\n  [WRITE] creating new file {path}:")
+            logger.info(f"[WRITE] creating new file {path}:")
             show_new_file(content, path)
 
         if not self._confirm("Confirm write?"):
@@ -398,7 +422,7 @@ class ToolSystem:
         new_content = content.replace(old_text, new_text)
 
         # 展示 diff（统一用 LF，避免换行符差异污染 diff 显示）
-        print(f"\n  [EDIT] {path} will be modified:")
+        logger.info(f"[EDIT] {path} will be modified:")
         show_diff(content, new_content, path)
 
         if not self._confirm("Confirm edit?"):
@@ -411,7 +435,7 @@ class ToolSystem:
         return f"File edited: {path}"
 
     def _tool_search_files(self, pattern: str, path: str = ".") -> str:
-        """在目录下搜索文本，返回匹配的文件和行。"""
+        """在目录下搜索文本，返回匹配的文件和行。流式逐行读取，避免大文件 OOM。"""
         target = self._safe_path(path)
         if not target.exists():
             return f"Error: directory does not exist: {path}"
@@ -419,6 +443,7 @@ class ToolSystem:
         ignore = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mca"}
         results = []
         max_results = 50  # 限制结果数量
+        max_file_size = 50 * 1024 * 1024  # 跳过超过 50MB 的文件，避免极端情况卡顿
 
         for root, dirs, files in os.walk(target):
             # 过滤无关目录
@@ -426,19 +451,29 @@ class ToolSystem:
 
             for fname in files:
                 fpath = Path(root) / fname
+
+                # 跳过超大型文件（如 minified JS、大型数据集）
                 try:
-                    text = fpath.read_text(encoding="utf-8")
-                except (UnicodeDecodeError, PermissionError):
+                    if fpath.stat().st_size > max_file_size:
+                        continue
+                except OSError:
                     continue
 
-                for i, line in enumerate(text.splitlines(), 1):
-                    if pattern.lower() in line.lower():
-                        rel = fpath.relative_to(self.working_dir)
-                        # 截取匹配行的上下文
-                        display = line.strip()[:120]
-                        results.append(f"  {rel}:{i}: {display}")
-                        if len(results) >= max_results:
-                            break
+                # 逐行流式读取：用 errors="ignore" 让二进制文件安全跳过坏字节，
+                # 不把整个文件读入内存（避免大文件 OOM）
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+                        for i, line in enumerate(fh, 1):
+                            if pattern.lower() in line.lower():
+                                rel = fpath.relative_to(self.working_dir)
+                                # 截取匹配行的上下文
+                                display = line.strip()[:120]
+                                results.append(f"  {rel}:{i}: {display}")
+                                if len(results) >= max_results:
+                                    break
+                except (OSError, UnicodeError):
+                    continue
+
                 if len(results) >= max_results:
                     break
             if len(results) >= max_results:
@@ -454,9 +489,11 @@ class ToolSystem:
 
     def _tool_run_command(self, command: str, timeout: int = 30) -> str:
         """
-        执行 shell 命令并返回输出。
+        执行命令并返回输出。
 
-        安全设计：
+        安全设计（v0.2.1 加固）：
+        - 使用 shell=False + shlex 解析参数列表，杜绝命令注入
+          （原来的 shell=True 会把 `; rm -rf /` 这类内容直接交给 shell 执行）
         - 需要用户确认后才执行
         - 设置超时防止命令卡死
         - 限制输出长度避免占用过多 token
@@ -465,16 +502,26 @@ class ToolSystem:
         # 限制超时范围
         timeout = max(5, min(timeout, 120))
 
-        print(f"\n  {Color.YELLOW}[COMMAND]{Color.RESET} {command}")
-        print(f"  {Color.YELLOW}Timeout:{Color.RESET} {timeout}s  {Color.YELLOW}Working dir:{Color.RESET} {self.working_dir}")
+        logger.info(f"[COMMAND] {command}")
+        logger.info(f"timeout: {timeout}s, working_dir: {self.working_dir}")
 
         if not self._confirm("Run this command?"):
             return "Command cancelled"
 
+        # 用 shlex 把命令字符串解析为参数列表，再以 shell=False 执行。
+        # 这样命令中的特殊字符（; & | > < $）不会被 shell 解释，避免注入。
+        try:
+            args = shlex.split(command)
+        except ValueError as e:
+            return f"Error: invalid command syntax: {e}"
+
+        if not args:
+            return "Error: empty command"
+
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                args,
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -563,7 +610,7 @@ class ToolSystem:
                 return f"Directory already exists: {path}"
             return f"Error: a file already exists at: {path}"
 
-        print(f"\n  {Color.YELLOW}[MKDIR]{Color.RESET} {path}")
+        logger.info(f"[MKDIR] {path}")
 
         if not self._confirm("Create directory?"):
             return "Operation cancelled"
@@ -581,7 +628,7 @@ class ToolSystem:
             return f"Error: path is a directory, not a file: {path}. To remove a directory, use run_command (e.g. 'rm -rf' on Unix or 'rmdir /s /q' on Windows)."
 
         size = target.stat().st_size
-        print(f"\n  {Color.RED}[DELETE]{Color.RESET} {path}  ({size} bytes)")
+        logger.warning(f"[DELETE] {path}  ({size} bytes)")
 
         if not self._confirm("Delete this file?"):
             return "Operation cancelled"
@@ -599,7 +646,7 @@ class ToolSystem:
         if dst.exists():
             return f"Error: destination already exists: {destination}"
 
-        print(f"\n  {Color.YELLOW}[MOVE]{Color.RESET} {source} → {destination}")
+        logger.info(f"[MOVE] {source} → {destination}")
 
         if not self._confirm("Move file?"):
             return "Operation cancelled"
