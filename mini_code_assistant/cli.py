@@ -144,24 +144,61 @@ def _parse_env_file(path: Path, config: dict):
 
 # ── MCP 配置加载器 ─────────────────────────────────────────────
 # 从 ~/.mca/mcp.json 读取 MCP Server 列表（全局配置）
+# 从 ./mcp.json 读取 MCP Server 列表（本地配置，本地优先）
 def load_mcp_config() -> list:
     """
-    从 ~/.mca/mcp.json 加载 MCP Server 配置。
-
-    返回 MCPServerConfig 列表；文件不存在 / 解析失败则返回空列表。
+    加载 MCP Server 配置，支持两级配置：
+    
+    1. 全局配置：~/.mca/mcp.json
+    2. 本地配置：./mcp.json（当前工作目录）
+    
+    本地配置的优先级高于全局配置。如果本地和全局存在同名的 Server，
+    本地配置将覆盖全局配置。
+    
+    返回 MCPServerConfig 列表；所有文件都不存在 / 解析失败则返回空列表。
     """
-    path = Path.home() / ".mca" / "mcp.json"
-    if not path.exists():
-        return []
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"[mcp] failed to read {path}: {e}")
-        return []
-    if not isinstance(raw, list):
-        logger.error(f"[mcp] {path} must be a JSON array of server configs")
-        return []
-    return [MCPServerConfig.from_dict(item) for item in raw]
+    # 1. 先加载全局配置（~/.mca/mcp.json）
+    global_path = Path.home() / ".mca" / "mcp.json"
+    global_configs = {}
+    if global_path.exists():
+        try:
+            raw = json.loads(global_path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for item in raw:
+                    cfg = MCPServerConfig.from_dict(item)
+                    global_configs[cfg.name] = cfg
+            else:
+                logger.error(f"[mcp] {global_path} must be a JSON array of server configs")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"[mcp] failed to read {global_path}: {e}")
+    
+    # 2. 再加载本地配置（./mcp.json），覆盖全局
+    local_path = Path.cwd() / "mcp.json"
+    local_configs = {}
+    if local_path.exists():
+        try:
+            raw = json.loads(local_path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for item in raw:
+                    cfg = MCPServerConfig.from_dict(item)
+                    local_configs[cfg.name] = cfg
+            else:
+                logger.error(f"[mcp] {local_path} must be a JSON array of server configs")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"[mcp] failed to read {local_path}: {e}")
+    
+    # 3. 合并配置：全局配置为基础，本地配置覆盖
+    merged = global_configs.copy()
+    merged.update(local_configs)
+    
+    # 记录配置来源
+    if local_configs:
+        logger.info(f"[mcp] loaded {len(local_configs)} local MCP config(s) from {local_path}")
+    if global_configs:
+        loaded_names = list(merged.keys())
+        logger.info(f"[mcp] loaded {len(global_configs)} global MCP config(s) from {global_path}, merged: {loaded_names}")
+    
+    return list(merged.values())
 
 
 # ── 终端颜色 ───────────────────────────────────────────────────

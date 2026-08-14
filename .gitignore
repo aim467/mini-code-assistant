@@ -2,3 +2,6 @@ mini_code_assistant.egg-info
 __pycache__
 *.pyc
 .env
+
+
+node_modules
