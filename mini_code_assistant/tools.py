@@ -20,10 +20,12 @@ tools.py - 工具系统
 """
 
 import os
+import sys
 import json
 import logging
 import shlex
 import subprocess
+import platform
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +33,32 @@ from .diff import show_diff, show_new_file, Color
 from .mcp import MCPManager
 
 logger = logging.getLogger(__name__)
+
+# 全局系统信息，供工具描述使用
+SYSTEM_INFO = {
+    "os": platform.system(),  # 'Windows', 'Linux', 'Darwin'
+    "os_version": platform.version(),
+    "os_release": platform.release(),
+    "machine": platform.machine(),
+    "processor": platform.processor(),
+    "python_version": platform.python_version(),
+}
+
+
+def _get_system_description() -> str:
+    """
+    生成系统描述信息，用于工具定义中告知 LLM 当前运行环境。
+    
+    这样 LLM 可以根据系统类型生成正确的命令。
+    """
+    sys_info = SYSTEM_INFO
+    desc_parts = [
+        f"Operating System: {sys_info['os']}",
+        f"Version: {sys_info['os_release']} ({sys_info['os_version']})",
+        f"Architecture: {sys_info['machine']}",
+        f"Python: {sys_info['python_version']}",
+    ]
+    return "; ".join(desc_parts)
 
 
 class ToolSystem:
@@ -170,8 +198,20 @@ class ToolSystem:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_system_info",
+                    "description": "Get information about the current system (OS, version, architecture). Use this before running commands to ensure compatibility.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "run_command",
-                    "description": "Execute a command-line tool (e.g. tests, builds, linters) and return its output. Runs WITHOUT a shell for safety (no pipes, redirects, or && chaining). Requires user confirmation.",
+                    "description": f"Execute a command-line tool (e.g. tests, builds, linters) and return its output. Runs WITHOUT a shell for safety (no pipes, redirects, or && chaining). Requires user confirmation. Current system: {_get_system_description()}",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -305,6 +345,7 @@ class ToolSystem:
 
         # 工具名 → 处理方法的映射
         handlers = {
+            "get_system_info": self._tool_get_system_info,
             "list_files": self._tool_list_files,
             "read_file": self._tool_read_file,
             "write_file": self._tool_write_file,
@@ -327,6 +368,55 @@ class ToolSystem:
             return f"Error: {type(e).__name__}: {e}"
 
     # ── 具体工具实现 ────────────────────────────────────────────
+
+    def _tool_get_system_info(self) -> str:
+        """
+        获取当前系统信息。
+        
+        返回操作系统的详细信息，帮助 LLM 生成兼容的命令。
+        """
+        info = SYSTEM_INFO
+        
+        # 构建常用命令提示
+        common_cmds = []
+        if info["os"] == "Windows":
+            common_cmds = [
+                "dir - List files (equivalent to ls)",
+                "type - Read file (equivalent to cat)",
+                "del - Delete file (equivalent to rm)",
+                "copy - Copy file (equivalent to cp)",
+                "move - Move file (equivalent to mv)",
+                "mkdir - Create directory",
+                "where - Locate program (equivalent to which)",
+                "python - Run Python interpreter",
+                "pip - Python package manager",
+            ]
+        elif info["os"] in ("Linux", "Darwin"):
+            common_cmds = [
+                "ls - List files",
+                "cat - Read file",
+                "rm - Delete file",
+                "cp - Copy file",
+                "mv - Move file",
+                "mkdir - Create directory",
+                "which - Locate program",
+                "python3 - Run Python interpreter",
+                "pip3 - Python package manager",
+            ]
+        
+        lines = [
+            f"OS: {info['os']}",
+            f"Release: {info['os_release']}",
+            f"Version: {info['os_version']}",
+            f"Machine: {info['machine']}",
+            f"Processor: {info['processor']}",
+            f"Python: {info['python_version']}",
+            "",
+            "Common commands on this system:",
+        ]
+        lines.extend(f"  - {cmd}" for cmd in common_cmds)
+        
+        return "\n".join(lines)
 
     def _tool_list_files(self, path: str = ".") -> str:
         """列出目录内容，忽略常见无关目录（如 .git, node_modules）。"""
@@ -511,26 +601,48 @@ class ToolSystem:
         - 设置超时防止命令卡死
         - 限制输出长度避免占用过多 token
         - 在工作目录下执行
+
+        跨平台设计：
+        - 自动检测操作系统类型
+        - 在命令描述中提供当前系统信息，让 LLM 生成兼容的命令
+        - 提供 get_system_info 工具供 LLM 查询
         """
         # 限制超时范围
         timeout = max(5, min(timeout, 120))
+        
+        # 获取系统信息用于日志
+        os_name = SYSTEM_INFO["os"]
 
         logger.info(f"[COMMAND] {command}")
-        logger.info(f"timeout: {timeout}s, working_dir: {self.working_dir}")
+        logger.info(f"timeout: {timeout}s, working_dir: {self.working_dir}, os: {os_name}")
 
         if not self._confirm("Run this command?"):
             return "Command cancelled"
 
         # 用 shlex 把命令字符串解析为参数列表，再以 shell=False 执行。
         # 这样命令中的特殊字符（; & | > < $）不会被 shell 解释，避免注入。
+        # 
+        # 注意：shlex.split() 在不同平台上有细微差异：
+        # - POSIX (Linux/macOS): 默认 posix=True
+        # - Windows: 使用 posix=False 更符合预期，但也支持 posix=True
+        #
+        # 使用 posix=False 可以确保在 Windows 上引号处理更一致，
+        # 并且在 Linux/macOS 上也工作良好。
         try:
-            args = shlex.split(command)
+            args = shlex.split(command, posix=False)
         except ValueError as e:
-            return f"Error: invalid command syntax: {e}"
+            # 如果 posix=False 失败，尝试 posix=True
+            try:
+                args = shlex.split(command, posix=True)
+            except ValueError:
+                return f"Error: invalid command syntax: {e}"
 
         if not args:
             return "Error: empty command"
 
+        # 在 Windows 上，如果命令没有包含路径分隔符，可能需要添加 .exe 扩展名
+        # 但是 subprocess 会自动处理这个问题，所以我们不需要手动处理
+        
         try:
             result = subprocess.run(
                 args,
@@ -566,6 +678,14 @@ class ToolSystem:
 
         except subprocess.TimeoutExpired:
             return f"Command timed out after {timeout}s: {command}"
+        except FileNotFoundError:
+            # 命令不存在，给出更友好的错误提示
+            cmd_name = args[0] if args else command.split()[0]
+            return (
+                f"Error: command not found: '{cmd_name}'\n"
+                f"Note: You are running on {os_name}.\n"
+                f"Use 'get_system_info' tool to see available commands."
+            )
         except Exception as e:
             return f"Error running command: {type(e).__name__}: {e}"
 
